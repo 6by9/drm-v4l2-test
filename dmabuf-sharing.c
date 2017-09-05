@@ -37,6 +37,16 @@
 
 #include <linux/videodev2.h>
 
+#include <interface/vcsm/user-vcsm.h>
+#include "interface/mmal/mmal.h"
+#include "interface/mmal/mmal_pool.h"
+#include "interface/mmal/mmal_port.h"
+#include "interface/mmal/mmal_queue.h"
+#include "interface/mmal/mmal_buffer.h"
+#include "interface/mmal/util/mmal_util.h"
+#include "interface/mmal/util/mmal_util_params.h"
+#include "bcm_host.h"
+
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -54,6 +64,7 @@ do { \
 	} \
 } while(0)
 
+#define ALIGN(x,n) (((x)+(n)-1) & ~((n)-1))
 static inline int warn(const char *file, int line, const char *fmt, ...)
 {
 	int errsv = errno;
@@ -91,6 +102,9 @@ struct buffer {
 	unsigned int bo_handle;
 	unsigned int fb_handle;
 	int dbuf_fd;
+	unsigned int vcsm_handle;
+	MMAL_BUFFER_HEADER_T *mmal_buffer;
+
 };
 
 struct stream {
@@ -98,7 +112,53 @@ struct stream {
 	int current_buffer;
 	int buffer_count;
 	struct buffer *buffer;
+	struct setup *s;
+	MMAL_QUEUE_T *queue;
 } stream;
+
+void mmal_log_dump_format(MMAL_ES_FORMAT_T *format)
+{
+   const char *name_type;
+
+   if (!format)
+      return;
+
+   switch(format->type)
+   {
+   case MMAL_ES_TYPE_AUDIO: name_type = "audio"; break;
+   case MMAL_ES_TYPE_VIDEO: name_type = "video"; break;
+   case MMAL_ES_TYPE_SUBPICTURE: name_type = "subpicture"; break;
+   default: name_type = "unknown"; break;
+   }
+
+   printf("type: %s, fourcc: %4.4s\n", name_type, (char *)&format->encoding);
+   printf(" bitrate: %i, framed: %i\n", format->bitrate,
+            !!(format->flags & MMAL_ES_FORMAT_FLAG_FRAMED));
+   printf(" extra data: %i, %p\n", format->extradata_size, format->extradata);
+   switch(format->type)
+   {
+   case MMAL_ES_TYPE_AUDIO:
+      printf(" samplerate: %i, channels: %i, bps: %i, block align: %i\n",
+               format->es->audio.sample_rate, format->es->audio.channels,
+               format->es->audio.bits_per_sample, format->es->audio.block_align);
+      break;
+
+   case MMAL_ES_TYPE_VIDEO:
+      printf(" width: %i, height: %i, (%i,%i,%i,%i)\n",
+               format->es->video.width, format->es->video.height,
+               format->es->video.crop.x, format->es->video.crop.y,
+               format->es->video.crop.width, format->es->video.crop.height);
+      printf(" pixel aspect ratio: %i/%i, frame rate: %i/%i\n",
+               format->es->video.par.num, format->es->video.par.den,
+               format->es->video.frame_rate.num, format->es->video.frame_rate.den);
+      break;
+
+   case MMAL_ES_TYPE_SUBPICTURE:
+      break;
+
+   default: break;
+   }
+}
 
 static void usage(char *name)
 {
@@ -233,12 +293,19 @@ static int buffer_create(struct buffer *b, int drmfd, struct setup *s,
 		fourcc >> 16,
 		fourcc >> 24);
 
+	b->vcsm_handle = vcsm_import_dmabuf(b->dbuf_fd, "DRM Buf");
+	if (!b->vcsm_handle)
+		goto fail_prime;
+
 	ret = drmModeAddFB2(drmfd, s->w, s->h, fourcc, bo_handles,
 		pitches, offsets, &b->fb_handle, 0);
 	if (WARN_ON(ret, "drmModeAddFB2 failed: %s\n", ERRSTR))
-		goto fail_prime;
+		goto fail_vcsm;
 
 	return 0;
+
+fail_vcsm:
+	vcsm_free(b->vcsm_handle);
 
 fail_prime:
 	close(b->dbuf_fd);
@@ -391,77 +458,139 @@ static int find_plane(int drmfd, struct setup *s)
 	return ret;
 }
 
+static void mmal_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+{
+	printf("Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
+	//vcos_log_error("File handle: %p", port->userdata);
+
+	if (port->is_enabled)
+		mmal_queue_put(stream.queue, buffer);
+	else
+		mmal_buffer_header_release(buffer);
+}
+
 int main(int argc, char *argv[])
 {
 	int ret;
 	struct setup s;
+	int v4lfd = -1;
+	struct v4l2_format fmt;
+	MMAL_COMPONENT_T *mmal_camera = NULL;
+	uint32_t size;
+	uint32_t pitch;
+	MMAL_POOL_T *pool = NULL;
+	MMAL_STATUS_T status;
+	int timeout;
 
 	ret = parse_args(argc, argv, &s);
 	BYE_ON(ret, "failed to parse arguments\n");
 	BYE_ON(s.module[0] == 0, "DRM module is missing\n");
-	BYE_ON(s.video[0] == 0, "video node is missing\n");
+//	BYE_ON(s.video[0] == 0, "video node is missing\n");
 
 	int drmfd = drmOpen(s.module, NULL);
 	BYE_ON(drmfd < 0, "drmOpen(%s) failed: %s\n", s.module, ERRSTR);
 
-	int v4lfd = open(s.video, O_RDWR);
-	BYE_ON(v4lfd < 0, "failed to open %s: %s\n", s.video, ERRSTR);
+	vcsm_init();
 
-	struct v4l2_capability caps;
-	memset(&caps, 0, sizeof caps);
+	if (s.video[0])
+	{
+		v4lfd = open(s.video, O_RDWR);
+		BYE_ON(v4lfd < 0, "failed to open %s: %s\n", s.video, ERRSTR);
 
-	ret = ioctl(v4lfd, VIDIOC_QUERYCAP, &caps);
-	BYE_ON(ret, "VIDIOC_QUERYCAP failed: %s\n", ERRSTR);
+		struct v4l2_capability caps;
+		memset(&caps, 0, sizeof caps);
 
-	/* TODO: add single plane support */
-	BYE_ON(~caps.capabilities & V4L2_CAP_VIDEO_CAPTURE,
-		"video: singleplanar capture is not supported\n");
+		ret = ioctl(v4lfd, VIDIOC_QUERYCAP, &caps);
+		BYE_ON(ret, "VIDIOC_QUERYCAP failed: %s\n", ERRSTR);
 
-	struct v4l2_format fmt;
-	memset(&fmt, 0, sizeof fmt);
-	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		/* TODO: add single plane support */
+		BYE_ON(~caps.capabilities & V4L2_CAP_VIDEO_CAPTURE,
+			"video: singleplanar capture is not supported\n");
 
-	ret = ioctl(v4lfd, VIDIOC_G_FMT, &fmt);
-	BYE_ON(ret < 0, "VIDIOC_G_FMT failed: %s\n", ERRSTR);
-	printf("G_FMT(start): width = %u, height = %u, 4cc = %.4s\n",
-		fmt.fmt.pix.width, fmt.fmt.pix.height,
-		(char*)&fmt.fmt.pix.pixelformat);
+		memset(&fmt, 0, sizeof fmt);
+		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-	if (s.use_wh) {
-		fmt.fmt.pix.width = s.w;
-		fmt.fmt.pix.height = s.h;
+		ret = ioctl(v4lfd, VIDIOC_G_FMT, &fmt);
+		BYE_ON(ret < 0, "VIDIOC_G_FMT failed: %s\n", ERRSTR);
+		printf("G_FMT(start): width = %u, height = %u, 4cc = %.4s\n",
+			fmt.fmt.pix.width, fmt.fmt.pix.height,
+			(char*)&fmt.fmt.pix.pixelformat);
+
+		if (s.use_wh) {
+			fmt.fmt.pix.width = s.w;
+			fmt.fmt.pix.height = s.h;
+		}
+		if (s.in_fourcc)
+			fmt.fmt.pix.pixelformat = s.in_fourcc;
+
+		ret = ioctl(v4lfd, VIDIOC_S_FMT, &fmt);
+		BYE_ON(ret < 0, "VIDIOC_S_FMT failed: %s\n", ERRSTR);
+
+		ret = ioctl(v4lfd, VIDIOC_G_FMT, &fmt);
+		BYE_ON(ret < 0, "VIDIOC_G_FMT failed: %s\n", ERRSTR);
+		printf("G_FMT(final): width = %u, height = %u, 4cc = %.4s\n",
+			fmt.fmt.pix.width, fmt.fmt.pix.height,
+			(char*)&fmt.fmt.pix.pixelformat);
+
+		struct v4l2_requestbuffers rqbufs;
+		memset(&rqbufs, 0, sizeof(rqbufs));
+		rqbufs.count = s.buffer_count;
+		rqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		rqbufs.memory = V4L2_MEMORY_DMABUF;
+
+		ret = ioctl(v4lfd, VIDIOC_REQBUFS, &rqbufs);
+		BYE_ON(ret < 0, "VIDIOC_REQBUFS failed: %s\n", ERRSTR);
+		BYE_ON(rqbufs.count < s.buffer_count, "video node allocated only "
+			"%u of %u buffers\n", rqbufs.count, s.buffer_count);
+
+		s.in_fourcc = fmt.fmt.pix.pixelformat;
+		s.w = fmt.fmt.pix.width;
+		s.h = fmt.fmt.pix.height;
+		size = fmt.fmt.pix.sizeimage;
+		pitch = fmt.fmt.pix.bytesperline;
+	} else {
+		MMAL_PORT_T *port;
+		bcm_host_init();
+
+		status = mmal_component_create("vc.ril.camera", &mmal_camera);
+		BYE_ON(status != MMAL_SUCCESS, "Creating camera");
+
+		port = mmal_camera->output[0];
+
+		if (s.use_wh) {
+			//To avoid issues over plane padding, just align the width to 32,
+			//and height to 16.
+			port->format->es->video.crop.width = ALIGN(s.w, 32);
+			port->format->es->video.crop.height = ALIGN(s.h, 16);
+			port->format->es->video.width = port->format->es->video.crop.width;
+			port->format->es->video.height = port->format->es->video.crop.height;
+		}
+		if (s.in_fourcc) {
+			//MMAL 4CCs generally match V4L2. Sorry if they don't.
+			port->format->encoding = s.in_fourcc;
+		}
+		port->buffer_num = s.buffer_count;
+
+		status = mmal_port_format_commit(port);
+		BYE_ON(status != MMAL_SUCCESS, "Format commit");
+
+		status = mmal_port_parameter_set_boolean(port, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+		BYE_ON(status != MMAL_SUCCESS, "zero copy");
+
+		s.w = port->format->es->video.crop.width;
+		s.h = port->format->es->video.crop.height;
+		size = port->buffer_size_min;
+		pitch = mmal_encoding_width_to_stride(port->format->encoding, s.w);
+
+		status = mmal_component_enable(mmal_camera);
+		BYE_ON(status != MMAL_SUCCESS, "Component enable");
+
+		stream.queue = mmal_queue_create();
+		BYE_ON(!stream.queue, "Failed to create queue");
 	}
-	if (s.in_fourcc)
-		fmt.fmt.pix.pixelformat = s.in_fourcc;
-
-	ret = ioctl(v4lfd, VIDIOC_S_FMT, &fmt);
-	BYE_ON(ret < 0, "VIDIOC_S_FMT failed: %s\n", ERRSTR);
-
-	ret = ioctl(v4lfd, VIDIOC_G_FMT, &fmt);
-	BYE_ON(ret < 0, "VIDIOC_G_FMT failed: %s\n", ERRSTR);
-	printf("G_FMT(final): width = %u, height = %u, 4cc = %.4s\n",
-		fmt.fmt.pix.width, fmt.fmt.pix.height,
-		(char*)&fmt.fmt.pix.pixelformat);
-
-	struct v4l2_requestbuffers rqbufs;
-	memset(&rqbufs, 0, sizeof(rqbufs));
-	rqbufs.count = s.buffer_count;
-	rqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	rqbufs.memory = V4L2_MEMORY_DMABUF;
-
-	ret = ioctl(v4lfd, VIDIOC_REQBUFS, &rqbufs);
-	BYE_ON(ret < 0, "VIDIOC_REQBUFS failed: %s\n", ERRSTR);
-	BYE_ON(rqbufs.count < s.buffer_count, "video node allocated only "
-		"%u of %u buffers\n", rqbufs.count, s.buffer_count);
-
-	s.in_fourcc = fmt.fmt.pix.pixelformat;
-	s.w = fmt.fmt.pix.width;
-	s.h = fmt.fmt.pix.height;
 
 	/* TODO: add support for multiplanar formats */
 	struct buffer buffer[s.buffer_count];
-	uint32_t size = fmt.fmt.pix.sizeimage;
-	uint32_t pitch = fmt.fmt.pix.bytesperline;
 	printf("size = %u pitch = %u\n", size, pitch);
 	for (unsigned int i = 0; i < s.buffer_count; ++i) {
 		ret = buffer_create(&buffer[i], drmfd, &s, size, pitch);
@@ -476,45 +605,99 @@ int main(int argc, char *argv[])
 	ret = find_plane(drmfd, &s);
 	BYE_ON(ret, "failed to find compatible plane\n");
 
-	for (unsigned int i = 0; i < s.buffer_count; ++i) {
-		struct v4l2_buffer buf;
-		memset(&buf, 0, sizeof buf);
-
-		buf.index = i;
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_DMABUF;
-		buf.m.fd = buffer[i].dbuf_fd;
-		ret = ioctl(v4lfd, VIDIOC_QBUF, &buf);
-		BYE_ON(ret < 0, "VIDIOC_QBUF for buffer %d failed: %s (fd %u)\n",
-			buf.index, ERRSTR, buffer[i].dbuf_fd);
-	}
-
-	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	ret = ioctl(v4lfd, VIDIOC_STREAMON, &type);
-	BYE_ON(ret < 0, "STREAMON failed: %s\n", ERRSTR);
-
-	struct pollfd fds[] = {
-		{ .fd = v4lfd, .events = POLLIN },
-		{ .fd = drmfd, .events = POLLIN },
-	};
+	struct pollfd fds[2] = { {0} };
+	int num_poll_fds = 0;
 
 	/* buffer currently used by drm */
+	stream.s = &s;
 	stream.v4lfd = v4lfd;
 	stream.current_buffer = -1;
 	stream.buffer = buffer;
 
-	while ((ret = poll(fds, 2, 5000)) > 0) {
-		struct v4l2_buffer buf;
+	if (v4lfd != -1) {
+		for (unsigned int i = 0; i < s.buffer_count; ++i) {
+			struct v4l2_buffer buf;
+			memset(&buf, 0, sizeof buf);
 
-		/* dequeue buffer */
-		memset(&buf, 0, sizeof buf);
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_DMABUF;
-		ret = ioctl(v4lfd, VIDIOC_DQBUF, &buf);
-		BYE_ON(ret, "VIDIOC_DQBUF failed: %s\n", ERRSTR);
+			buf.index = i;
+			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			buf.memory = V4L2_MEMORY_DMABUF;
+			buf.m.fd = buffer[i].dbuf_fd;
+			ret = ioctl(v4lfd, VIDIOC_QBUF, &buf);
+			BYE_ON(ret < 0, "VIDIOC_QBUF for buffer %d failed: %s (fd %u)\n",
+				buf.index, ERRSTR, buffer[i].dbuf_fd);
+		}
+
+		int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		ret = ioctl(v4lfd, VIDIOC_STREAMON, &type);
+		BYE_ON(ret < 0, "STREAMON failed: %s\n", ERRSTR);
+		fds[0].fd = v4lfd;
+		fds[0].events = POLLIN;
+		fds[1].fd = drmfd;
+		fds[1].events = POLLIN;
+		num_poll_fds = 2;
+		timeout = 5000;
+	} else {
+		status = mmal_port_enable(mmal_camera->output[0], mmal_callback);
+		if(status != MMAL_SUCCESS)
+			printf("Failed to enable port");
+
+		pool = mmal_pool_create(s.buffer_count, 0);
+		for (unsigned int i = 0; i < s.buffer_count; ++i) {
+			MMAL_BUFFER_HEADER_T *buf = mmal_queue_get(pool->queue);
+			BYE_ON(!buf, "No MMAL buffer header");
+
+			buf->data = (uint8_t*)vcsm_vc_hdl_from_hdl(buffer[i].vcsm_handle);
+			buf->alloc_size = size;
+			buf->length = 0;
+			buffer[i].mmal_buffer = buf;
+			printf("Sending buf %p, alloc_size %d, data %p\n", buf, buf->alloc_size, buf->data);
+			status = mmal_port_send_buffer(mmal_camera->output[0], buf);
+			if (status != MMAL_SUCCESS)
+				printf("Failed to send buffer %p - %d\n", buf, status);
+		}
+
+		fds[0].fd = drmfd;
+		fds[0].events = POLLIN;
+		num_poll_fds = 1;
+		timeout = 50;
+	}
+
+	while ((ret = poll(fds, num_poll_fds, timeout)) > 0 || v4lfd == -1) {
+		int index = 0;
+		if (v4lfd != -1) {
+			struct v4l2_buffer buf;
+
+			/* dequeue buffer */
+			memset(&buf, 0, sizeof buf);
+			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			buf.memory = V4L2_MEMORY_DMABUF;
+			ret = ioctl(v4lfd, VIDIOC_DQBUF, &buf);
+			BYE_ON(ret, "VIDIOC_DQBUF failed: %s\n", ERRSTR);
+			index = buf.index;
+		} else {
+			MMAL_BUFFER_HEADER_T *mmal_buffer = mmal_queue_get(stream.queue);
+			if (mmal_buffer)
+			{
+				unsigned int i;
+				for (i = 0; i < stream.s->buffer_count; i++) {
+					if (stream.buffer[i].mmal_buffer == mmal_buffer) {
+						printf("Matches buffer index %u\n", i);
+						index = i;
+						break;
+					}
+				}
+				if (i == stream.s->buffer_count) {
+					printf("Failed to find matching buffer for mmal buffer %p\n", mmal_buffer);
+					continue;
+				}
+			}
+			else
+				continue;
+		}
 
 		ret = drmModeSetPlane(drmfd, s.planeId, s.crtcId,
-				      buffer[buf.index].fb_handle, 0,
+				      buffer[index].fb_handle, 0,
 				      s.compose.left, s.compose.top,
 				      s.compose.width,
 				      s.compose.height,
@@ -522,19 +705,28 @@ int main(int argc, char *argv[])
 		BYE_ON(ret, "drmModeSetPlane failed: %s\n", ERRSTR);
 
 		if (stream.current_buffer != -1) {
-			memset(&buf, 0, sizeof buf);
-			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-			buf.memory = V4L2_MEMORY_DMABUF;
-			buf.index = stream.current_buffer;
-			buf.m.fd = stream.buffer[stream.current_buffer].dbuf_fd;
+			if (v4lfd != -1) {
+				struct v4l2_buffer buf;
+				memset(&buf, 0, sizeof buf);
+				buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+				buf.memory = V4L2_MEMORY_DMABUF;
+				buf.index = stream.current_buffer;
+				buf.m.fd = stream.buffer[stream.current_buffer].dbuf_fd;
 
-			ret = ioctl(stream.v4lfd, VIDIOC_QBUF, &buf);
-			BYE_ON(ret, "VIDIOC_QBUF(index = %d) failed: %s\n",
-			       stream.current_buffer, ERRSTR);
+				ret = ioctl(stream.v4lfd, VIDIOC_QBUF, &buf);
+				BYE_ON(ret, "VIDIOC_QBUF(index = %d) failed: %s\n",
+				       stream.current_buffer, ERRSTR);
+			} else {
+				MMAL_BUFFER_HEADER_T *buf = stream.buffer[stream.current_buffer].mmal_buffer;
+				buf->length = 0;
+				buf->flags = 0;
+				mmal_port_send_buffer(mmal_camera->output[0], buf);
+			}
 		}
 
-		stream.current_buffer = buf.index;
+		stream.current_buffer = index;
 	}
+	printf("All done\n");
 
 	return 0;
 }
